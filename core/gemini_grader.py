@@ -3,12 +3,36 @@ import time
 import json
 import random
 import re
+import concurrent.futures
+import threading
 from typing import List, Dict, Any, Optional
 from PIL import Image
 
+# .env 환경 설정 자동 로드 (API 키 보안 및 자동 입력)
+_root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_env_file = os.path.join(_root_dir, ".env")
+if os.path.exists(_env_file):
+    try:
+        with open(_env_file, "r", encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _v = _line.split("=", 1)
+                    if _k.strip() == "GEMINI_API_KEY" and not os.environ.get("GEMINI_API_KEY"):
+                        os.environ["GEMINI_API_KEY"] = _v.strip()
+    except Exception:
+        pass
+
 class GeminiGrader:
-    def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash"):
-        self.api_key = api_key.strip()
+    FALLBACK_MODELS = [
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.8-flash"
+    ]
+
+    def __init__(self, api_key: str = "", model_name: str = "gemini-3.5-flash-lite"):
+        self.api_key = (api_key.strip() if api_key and api_key.strip() else os.getenv("GEMINI_API_KEY", "")).strip()
         self.model_name = model_name.strip()
         self._init_client()
 
@@ -24,9 +48,9 @@ class GeminiGrader:
             self.client_type = "legacy"
             self.legacy_genai = legacy_genai
 
-    def _call_with_retry(self, contents: list, json_mode: bool = True, max_retries: int = 5) -> str:
-        """API Rate Limit 및 일시적 오류에 대응하는 지수 백오프 재시도 함수"""
-        delay = 2.0
+    def _call_with_retry(self, contents: list, json_mode: bool = True, max_retries: int = 6) -> str:
+        """API Rate Limit 및 일시적 오류에 대응하며, Quota 소진 시 자동 모델 전환(Failover) 지원"""
+        delay = 1.5
         last_error = None
 
         for attempt in range(max_retries):
@@ -60,12 +84,28 @@ class GeminiGrader:
             except Exception as e:
                 last_error = e
                 err_str = str(e).lower()
-                # 429 Resource Exhausted / Rate limit / Quota exceeded 또는 일시적 서버 오류 감지
-                if "429" in err_str or "quota" in err_str or "exhausted" in err_str or "503" in err_str or "overloaded" in err_str:
+                
+                # 429 RESOURCE_EXHAUSTED / Quota 초과 감지 시 다른 모델로 즉시 자동 Failover 전환
+                if "429" in err_str or "quota" in err_str or "exhausted" in err_str:
+                    curr_idx = -1
+                    for idx, m in enumerate(self.FALLBACK_MODELS):
+                        if m in self.model_name:
+                            curr_idx = idx
+                            break
+                    next_idx = (curr_idx + 1) % len(self.FALLBACK_MODELS)
+                    next_model = self.FALLBACK_MODELS[next_idx]
+                    
+                    if next_model != self.model_name:
+                        print(f"⚠️ [스마트 자동 전환] {self.model_name} 쿼터 제한 도달 -> {next_model} 로 자동 전환하여 계속 진행합니다.")
+                        self.model_name = next_model
+                        time.sleep(1.0)
+                        continue
+
+                # 503 Overloaded 또는 일시적 서버 오류 감지
+                if "503" in err_str or "overloaded" in err_str:
                     jitter = random.uniform(0.5, 1.5)
-                    sleep_time = delay + jitter
-                    time.sleep(sleep_time)
-                    delay *= 2.0
+                    time.sleep(delay + jitter)
+                    delay *= 1.5
                 else:
                     time.sleep(1.5)
 
@@ -105,10 +145,12 @@ class GeminiGrader:
 제공된 이미지들은 초등학교 '수행평가 계획안' 및 '교사별 평가 기준안' 문서 페이지들입니다.
 문서의 서식이나 표 양식에 구애받지 않고, 포함된 모든 과목 및 단원별 평가 기준을 파싱하여 다음 JSON 스키마의 배열로 추출해 주세요.
 
-[중요 통합 및 매칭 규칙]
-1. 계획서와 교사별 기준안의 단원명 표기가 약간 다르더라도(예: 계획서의 '5. 의견이 드러나게 글을 써요' vs 기준안의 '3. 의견을 모아서') 성취기준과 평가요소의 내용 및 맥락이 같으면 동일한 하나의 평가 단원으로 스마트하게 병합하세요.
-2. '모범답안_및_유의점'에는 교사별 기준안에 제시된 예시 답안, 문항별 정답, 채점 시 유의사항 등을 핵심 요약하여 포함하세요.
-3. 4단계 평가기준(매우잘함, 잘함, 보통, 노력요함)의 문장을 누락 없이 명확히 추출하세요.
+[중요 통합 및 모범답안 상세 추출 규칙]
+1. 계획서와 교사별 기준안의 단원명 표기가 약간 다르더라도 성취기준과 평가요소의 맥락이 같으면 동일한 하나의 평가 단원으로 스마트하게 병합하세요.
+2. [문항별 기준 정답 및 모범답안 상세 추출]:
+   - '교사별 평가 기준안'에 기재된 각 문항별 정답(선다형/단답형 정답, 서술형 모범답안, 수학 계산식 및 정답 분수/소수, 도표/그래프 그리기 기준, 채점 유의점 등)을 절대로 요약하거나 축약하지 마십시오!
+   - 문항 번호별(예: 1번 정답: ..., 2번 정답: ...)로 원문 그대로 상세하게 추출하여 '모범답안_및_유의점' 항목에 모두 담아주세요. 이 정답이 학생 시험지 채점의 절대적 기준 답안이 됩니다.
+3. 4단계 평가기준(매우잘함, 잘함, 보통, 노력요함)의 도달 기준 문장을 누락 없이 명확히 추출하세요.
 
 [반환 JSON 스키마]
 [
@@ -123,7 +165,7 @@ class GeminiGrader:
       "보통": "보통 도달 기준",
       "노력요함": "노력 요함 도달 기준"
     },
-    "모범답안_및_유의점": "예시 답안, 정답 및 유의사항 요약"
+    "모범답안_및_유의점": "문항 1번 정답: ..., 문항 2번 정답: ... 등 문항별 상세 기준 정답 및 모범답안 전체"
   }
 ]
 반드시 유효한 JSON 형식의 배열로만 답변해 주세요.
@@ -168,19 +210,99 @@ class GeminiGrader:
     def group_student_exam_pages(
         self,
         exam_pages: List[Dict[str, Any]],
-        progress_callback=None
+        split_mode: str = "2pages",  # "2pages" (2장 앞/뒤), "1page" (1장), "auto" (AI 자동 판독)
+        progress_callback=None,
+        *args,
+        **kwargs
     ) -> List[Dict[str, Any]]:
         """
-        시험지 각 페이지의 상단 헤더를 인식하고,
-        인적사항(반/번호/이름) 칸이 없고 문항이 앞장과 이어지는 뒷장의 경우
-        직전 학생에게 자동 병합하여 다중 페이지 시험지를 형성합니다.
-        번호 미기재 시 '미상_1', '미상_2' 등으로 자동 분류합니다.
+        학생 시험지를 분할 및 병합합니다.
+        - "2pages": 앞·뒷장 2페이지 단위로 즉시 분할 (API 호출 0회, 쿼터 소모 0)
+        - "1page": 1페이지 단위로 즉시 분할 (API 호출 0회, 쿼터 소모 0)
+        - "auto": Vision AI로 헤더를 판독하여 자동 병합
         """
+        if "split_mode" in kwargs:
+            split_mode = kwargs["split_mode"]
+        elif args and len(args) >= 1:
+            split_mode = args[0]
+        if "progress_callback" in kwargs and progress_callback is None:
+            progress_callback = kwargs["progress_callback"]
+
         total = len(exam_pages)
         if total == 0:
             return []
 
-        # 1차로 각 페이지의 헤더 정보를 Vision AI로 빠르게 판독
+        # 1. 파일별로 페이지들을 분리 (예: 국어 파일 페이지들과 수학 파일 페이지들을 절대 섞지 않음)
+        files_dict = {}
+        for p in exam_pages:
+            fn = p.get("filename", "시험지.pdf")
+            files_dict.setdefault(fn, []).append(p)
+
+        def detect_subject_from_filename(filename_str: str) -> str:
+            sub_candidates = ["국어", "수학", "사회", "과학", "영어", "도덕", "음악", "미술", "체육", "실과"]
+            for s in sub_candidates:
+                if s in filename_str:
+                    return s
+            return ""
+
+        student_submissions = []
+
+        # 2. 2페이지 단위 즉시 분할 모드 (초고속, 쿼터 소모 0회, 파일별 독립 분할)
+        if split_mode == "2pages":
+            for fn, f_pages in files_dict.items():
+                f_total = len(f_pages)
+                inferred_sub = detect_subject_from_filename(fn)
+                for i in range(0, f_total, 2):
+                    s_num = (i // 2) + 1
+                    pages_chunk = []
+                    for p_idx in range(i, min(i + 2, f_total)):
+                        p_item = f_pages[p_idx]
+                        pages_chunk.append({
+                            "filename": p_item.get("filename", ""),
+                            "page_num": p_item.get("page_num", 1),
+                            "image": p_item.get("image")
+                        })
+                    student_submissions.append({
+                        "student_key": f"{fn}_{s_num}",
+                        "source_file": fn,
+                        "학년": "",
+                        "반": "",
+                        "번호": str(s_num),
+                        "이름": f"학생_{s_num}",
+                        "과목": inferred_sub,
+                        "단원명": "",
+                        "pages": pages_chunk
+                    })
+            if progress_callback:
+                progress_callback(0.4, f"파일별 2페이지 단위로 총 {len(student_submissions)}명 학생 시험지를 분할했습니다. (쿼터 소모 0)")
+            return student_submissions
+
+        # 3. 1페이지 단위 즉시 분할 모드 (초고속, 쿼터 소모 0회, 파일별 독립 분할)
+        if split_mode == "1page":
+            for fn, f_pages in files_dict.items():
+                inferred_sub = detect_subject_from_filename(fn)
+                for i, p_item in enumerate(f_pages):
+                    s_num = i + 1
+                    student_submissions.append({
+                        "student_key": f"{fn}_{s_num}",
+                        "source_file": fn,
+                        "학년": "",
+                        "반": "",
+                        "번호": str(s_num),
+                        "이름": f"학생_{s_num}",
+                        "과목": inferred_sub,
+                        "단원명": "",
+                        "pages": [{
+                            "filename": p_item.get("filename", ""),
+                            "page_num": p_item.get("page_num", 1),
+                            "image": p_item.get("image")
+                        }]
+                    })
+            if progress_callback:
+                progress_callback(0.4, f"파일별 1페이지 단위로 총 {len(student_submissions)}명 학생 시험지를 분할했습니다. (쿼터 소모 0)")
+            return student_submissions
+
+        # 3. Vision AI 자동 판독 모드
         header_prompt = """
 시험지 페이지의 상단 헤더 영역을 판독하여 다음 정보를 JSON 객체로 반환해 주세요.
 
@@ -205,22 +327,31 @@ class GeminiGrader:
   "단원명": "1. 분수의 덧셈과 뺄셈"
 }
 """
-        page_analyses = []
+        page_analyses = [None] * total
         unknown_counter = 1
+        completed_lock = threading.Lock()
+        completed_count = 0
 
-        for idx, p_item in enumerate(exam_pages):
-            if progress_callback:
-                pct = 0.1 + (idx / total) * 0.4
-                progress_callback(pct, f"시험지 페이지 헤더 판독 중... ({idx+1}/{total} 페이지)")
+        def process_single_header(task_args):
+            idx, p_item = task_args
+            p_img = p_item["image"]
+            
+            # 헤더 판독 최적화: 시험지 상단 28% 영역만 잘라서 전송 (용량 1/4 감소 & 처리속도 급상승)
+            try:
+                w, h = p_img.size
+                header_crop = p_img.crop((0, 0, w, int(h * 0.28)))
+            except Exception:
+                header_crop = p_img
 
             contents = [
                 header_prompt,
                 f"파일명: {p_item['filename']}, 페이지: {p_item['page_num']}",
-                p_item["image"]
+                header_crop
             ]
-            resp = self._call_with_retry(contents, json_mode=True)
-            cleaned = self._clean_json_text(resp)
+            
             try:
+                resp = self._call_with_retry(contents, json_mode=True)
+                cleaned = self._clean_json_text(resp)
                 header_data = json.loads(cleaned)
             except Exception:
                 header_data = {
@@ -232,17 +363,41 @@ class GeminiGrader:
                     "과목": "",
                     "단원명": ""
                 }
-            
-            page_analyses.append({
+
+            return idx, {
                 "page_info": p_item,
                 "header": header_data
-            })
+            }
+
+        # 4개 동시 스레드로 병렬 판독 (88페이지도 30~50초 내에 초고속 완료)
+        max_workers = min(4, total) if total > 0 else 1
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            tasks = [(i, p) for i, p in enumerate(exam_pages)]
+            futures = [executor.submit(process_single_header, t) for t in tasks]
+
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    idx, result = future.result()
+                    page_analyses[idx] = result
+                except Exception as ex:
+                    pass
+
+                with completed_lock:
+                    completed_count += 1
+                    if progress_callback:
+                        pct = 0.1 + (completed_count / total) * 0.4
+                        progress_callback(pct, f"시험지 페이지 헤더 판독 중... ({completed_count}/{total} 페이지)")
 
         # 다중 페이지 병합 처리
         student_submissions = []
         current_student = None
 
         for idx, item in enumerate(page_analyses):
+            if item is None:
+                item = {
+                    "page_info": exam_pages[idx],
+                    "header": {"is_new_student_header": False, "번호": "미상", "이름": "미상"}
+                }
             header = item["header"]
             p_img = item["page_info"]["image"]
             page_meta = {
@@ -293,8 +448,72 @@ class GeminiGrader:
 
         return student_submissions
 
+    def _recognize_name_from_crop(self, header_img: Image.Image) -> str:
+        """인적사항 크롭 이미지에서 손글씨 학생 이름만 정밀 핀포인트 추출 (2차 안전장치)"""
+        try:
+            name_prompt = (
+                "이 이미지는 초등학교 시험지 상단의 [반, 번호, 이름] 기재란입니다. "
+                "연필이나 볼펜으로 적힌 학생의 손글씨 이름(보통 2~4글자 한글 이름, 예: 김민수, 이서연 등)만 정확히 단답형으로 출력하세요. "
+                "설명, 따옴표, 접두어 없이 이름만 한글로 출력하세요. "
+                "손글씨 이름이 전혀 없거나 빈칸이면 '미상'이라고만 출력하세요."
+            )
+            resp = self._call_with_retry([name_prompt, header_img], json_mode=False, max_retries=3)
+            cleaned = resp.strip().replace('"', '').replace("'", "").replace(".", "").strip()
+            # 한글 2~4글자 이름 추출
+            hangul_match = re.search(r'[가-힣]{2,4}', cleaned)
+            if hangul_match:
+                return hangul_match.group(0)
+            return cleaned if cleaned and cleaned != "미상" else ""
+        except Exception:
+            return ""
+
+    def _clean_comment(self, comment: str, student_name: str = "") -> str:
+        """
+        초등 생기부 공식 규격에 맞게 평어에서 '학생' 지칭 주어와 '문제 번호 및 선택지 기호'를 완벽히 제거 및 정제합니다.
+        """
+        if not comment:
+            return ""
+        text = comment.strip()
+
+        # 1. 특정 학생 이름 주어 제거
+        if student_name and len(student_name) >= 2 and student_name not in ["미상", "학생"]:
+            name_esc = re.escape(student_name)
+            text = re.sub(rf'^{name_esc}\s*(학생은|학생이|학생의|학생도|학생에게|학생|은|는|이가|이)?\s*', '', text)
+            text = re.sub(rf'\b{name_esc}\s*(학생은|학생이|학생의|학생도|학생에게|학생|은|는|이가|이)?\s*', '', text)
+
+        # 2. 일반 학생 지칭 표현 제거 (문두 및 문중)
+        student_patterns = [
+            r'^(위\s*학생은|본\s*학생은|이\s*학생은|해당\s*학생은|학생은|위\s*학생의|본\s*학생의|학생이|학생도|학생에게)\s*',
+            r'(위\s*학생은|본\s*학생은|이\s*학생은|해당\s*학생은)\s*',
+            r'\b학생은\s*',
+            r'\b학생이\s*',
+            r'\b학생의\s*',
+            r'\b학생에게\s*',
+            r'\b학생도\s*',
+            r'\b학생\s*',
+        ]
+        for pat in student_patterns:
+            text = re.sub(pat, '', text)
+
+        # 3. 조사 목록 확장: 에서도, 으로, 로, 에서, 의, 을, 를, 은, 는, 에, 과, 와, 도
+        postpositions = r'(에서도|으로|로|에서|의|을|를|은|는|에|과|와|도)?\s*'
+        text = re.sub(rf'\b\d+\s*번\s*(문항|문제)?\s*{postpositions}', '', text)
+        text = re.sub(rf'\b(문항|문제)\s*\d+\s*{postpositions}', '', text)
+        text = re.sub(rf'\b제\s*\d+\s*(문항|문제)\s*{postpositions}', '', text)
+
+        # 4. 선택지 및 기호 제거: ①~⑮, ㉠~㉭, ㉮~㉻
+        text = re.sub(rf'[①-⑮㉠-㉭㉮-㉻]\s*(번)?\s*(문항|문제|선택지|보기|기호)?\s*{postpositions}', '', text)
+        text = re.sub(rf'\b(선택지|보기|기호)\s*([①-⑮㉠-㉭㉮-㉻A-Da-d1-5번]|에서도|에서|의|를|을|에)?\s*', '', text)
+
+        # 5. 문두 찌꺼기 및 기호 정제
+        text = re.sub(r'^[,\s\-\.\·\:\;\~\^]+', '', text)
+        text = re.sub(r'^(또한|그리고|하지만|그러나|따라서|이에|이와\s*함께)\s*,\s*', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        return text
+
     # =========================================================================
-    # Step 3: 기준 기반 채점, 4단계 등급 부여 및 150자 평어 생성
+    # Step 3: 기준 기반 채점, 4단계 등급 부여 및 100자 내외 개별 맞춤 평어 생성
     # =========================================================================
     def grade_student(
         self,
@@ -305,32 +524,23 @@ class GeminiGrader:
         """
         학생의 시험지(단일/다중 페이지) 이미지를 분석하여
         해당 과목/단원 평가기준 및 모범답안을 바탕으로 4단계 등급 판정 및
-        150자 내외(130~170자) 생기부 평어를 생성합니다.
+        100자 내외(90~110자) 생기부 맞춤 평어를 생성합니다.
         """
-        # 가장 적절한 루브릭 매칭 (과목 + 단원명)
         target_subject = str(student.get("과목", "")).strip()
         target_unit = str(student.get("단원명", "")).strip()
+        scan_order_num = str(student.get("번호", "1")).strip()
 
-        matched_rubric = None
-        # 1. 과목 & 단원명 동시 매칭 시도
-        for r in rubrics:
-            r_sub = str(r.get("과목", "")).strip()
-            r_unit = str(r.get("단원명", "")).strip()
-            if target_subject and r_sub in target_subject or target_subject in r_sub:
-                if target_unit and (r_unit in target_unit or target_unit in r_unit):
-                    matched_rubric = r
-                    break
-
-        # 2. 과목만이라도 매칭 시도
-        if not matched_rubric and target_subject:
+        # 1. 학생의 과목에 일치하는 모든 교사별 평가 기준안 수집
+        relevant_rubrics = []
+        if target_subject:
             for r in rubrics:
-                if target_subject in str(r.get("과목", "")):
-                    matched_rubric = r
-                    break
+                r_sub = str(r.get("과목", "")).strip()
+                if target_subject in r_sub or r_sub in target_subject:
+                    relevant_rubrics.append(r)
 
-        # 3. 매칭 안 될 경우 첫 번째 루브릭 참고
-        if not matched_rubric and rubrics:
-            matched_rubric = rubrics[0]
+        # 2. 과목 매칭이 없으면 전체 기준안 제공
+        if not relevant_rubrics:
+            relevant_rubrics = rubrics
 
         tone_instruction = (
             "종합 평어는 학교생활기록부/통지표 기재 형식에 맞추어 '~함.', '~보임.', '~나타냄.'과 같은 간결한 명사형/개조식 문체로 작성하세요."
@@ -338,43 +548,84 @@ class GeminiGrader:
             else "종합 평어는 학부모 안내 및 격려용으로 알맞게 '~합니다.', '~보입니다.'와 같은 정중하고 따뜻한 해요/하십시오체로 작성하세요."
         )
 
-        rubric_summary = json.dumps(matched_rubric, ensure_ascii=False, indent=2) if matched_rubric else "평가 기준 없음"
+        rubric_summary = json.dumps(relevant_rubrics, ensure_ascii=False, indent=2) if relevant_rubrics else "평가 기준 없음"
+
+        # 3. 시험지 1페이지 상단 인적사항 영역 선명 크롭 (이름/번호 핀포인트 인식용)
+        first_page_img = student["pages"][0]["image"] if student.get("pages") else None
+        header_crop = None
+        if first_page_img:
+            try:
+                w, h = first_page_img.size
+                header_crop = first_page_img.crop((0, 0, w, int(h * 0.22)))
+            except Exception:
+                header_crop = None
 
         grading_prompt = f"""
-당신은 대한민국 초등학교 교사로서 학생의 수행평가 시험지를 엄정하고 따뜻하게 채점하고 평어를 작성하는 AI입니다.
+당신은 대한민국 초등학교 교사로서 학생의 수행평가 시험지를 엄정하고 따뜻하게 채점하고, 학생마다 고유한 100자 맞춤 평어를 작성하는 AI입니다.
 
-[적용 평가 기준 및 모범 답안]
+[교사별 평가 기준안 (문항별 기준 정답 및 모범답안)]
 {rubric_summary}
 
-[학생 정보]
-- 학년/반/번호: {student.get('학년','')}학년 {student.get('반','')}반 {student.get('번호','')}번
-- 이름: {student.get('이름','')}
-- 과목: {student.get('과목','')}
-- 단원명: {student.get('단원명','')}
+[학생 기본 정보]
+- 과목: {target_subject or '시험지 표기 과목'}
+- 스캔 순번: {scan_order_num}번 (※ 시험지는 1번부터 차례대로 정리되어 있습니다)
 
-[채점 지침]
-1. 학생의 시험지 이미지를 면밀히 확인하세요. 손글씨 서술형 답안, 수학 풀이식 및 분수 색칠 그림, 꺾은선그래프 점 찍기 및 선 연결, 사회 홍보물 포스터/그림 및 슬로건 문구 등 시각적인 모든 요소를 정확하게 파독하세요.
-2. 학생의 답안을 모범답안 및 채점기준과 비교하여 정답 여부와 성취 수준을 종합적으로 분석하세요.
-3. [등급 산출]: 반드시 '매우잘함', '잘함', '보통', '노력요함' 4개 등급 중 단 하나를 선택하여 부여하세요.
-4. [답안 요약 및 채점 근거]: 학생이 쓴 답안 내용과 잘된 점, 오류나 보완할 점을 핵심적으로 기술하세요.
-5. [평가 의견 (150자 평어)]:
-   - 학생이 실제로 작성한 답안 내용의 구체적 사례, 성취수준, 그리고 칭찬과 발전 과제를 균형 있게 담아 작성하세요.
-   - 글자 수는 공백 포함 **반드시 130자 ~ 170자 사이 (150자 내외)** 로 정밀하게 작성하세요.
-   - {tone_instruction}
+[채점 및 판독 핵심 지침]
+★ 절대 준수 사항 1: [교사별 평가 기준안 기준 1:1 대조 채점]
+- 반드시 위 [교사별 평가 기준안]에 명시된 문항별 정답, 계산식, 서술형 모범답안을 절대적인 채점 기준으로 삼으세요.
+- 학생 답안을 위 기준안의 정답과 1:1로 직접 대조하여 정오답을 엄정하게 판정하고, 4단계 성취수준(매우잘함, 잘함, 보통, 노력요함) 중 하나를 부여하세요.
+- '답안요약_및_근거'란에는 기준안의 정답 대비 학생이 맞힌 문항과 틀린 문항, 구체적인 오류 원인을 상세히 기술하세요.
+
+★ 절대 준수 사항 2: [학생 인적사항(이름/번호) 정확 판독 - 지문 속 인물 혼동 절대 금지]
+- 제공된 [이미지 1]은 시험지 1페이지 상단의 '반, 번호, 이름' 기재란 확대본입니다.
+- '이름: ( )' 란에 학생이 연필/볼펜으로 쓴 실제 손글씨 이름을 정확하게 읽어 응답 JSON의 '이름'에 적으세요. (초등학생 이름은 보통 2~4글자 한글)
+- ★ 주의: 시험 문제나 지문 속 이야기의 등장인물(소설 주인공, 역사 인물, 지문 속 대화 상대 등)을 절대로 학생 이름으로 쓰지 마십시오! 오직 상단 '이름:' 란에 손글씨로 쓴 이름만 적어야 합니다.
+- '번호: ( )' 란의 손글씨 번호도 읽으세요. (스캔 순서상 기본 번호는 {scan_order_num}번입니다.)
+
+★ 절대 준수 사항 3: [100자 내외 개별화 평어 작성 - '학생' 언급 및 '문제 번호/선택지 기호' 일체 언급 금지]
+- 분량 준수: 공백 포함 **반드시 90자 ~ 110자 사이 (100자 내외)** 로 정밀하게 작성하세요. (85자 미만 또는 115자 초과 엄격히 금지)
+- [금지 1: 학생 지칭 주어 절대 사용 금지 (초등 학교생활기록부 공식 기재 규정)]
+  * '학생은', '위 학생은', '본 학생은', '이 학생은', '해당 학생은', 'OO 학생은', 학생 이름('민준이는' 등) 등 학생을 지칭하는 단어를 절대로 사용하지 마십시오!
+  * 평어 문장 전체에서 '학생'이라는 단어 자체를 일절 쓰지 마십시오.
+  * 반드시 주어를 생략하고 구체적인 교과 학습 행동이나 성취 내용으로 문장을 곧바로 시작하십시오.
+    - [잘못된 예]: "위 학생은 분수의 덧셈을 바르게 계산하고..." (X)
+    - [잘못된 예]: "김민준 학생은 중심 문장을 잘 찾았으나..." (X)
+    - [올바른 예]: "분수의 덧셈과 뺄셈 원리를 명확하게 이해하고 통분 과정을 차근차근 전개하여 계산을 정확히 해결함." (O)
+- [금지 2: 문제 번호 및 선택지 기호 언급 절대 금지]
+  * '1번 문항', '2번 문제', '3번에서', '4번 답안', '문항 1' 등 시험지 문제 번호를 절대로 언급하지 마십시오.
+  * '①번', '②', '㉠', '㉡', '보기' 등 선택지 기호를 절대로 언급하지 마십시오.
+  * 문제 번호나 기호 대신 학생이 수행한 구체적인 '교과 학습 내용 및 핵심 개념 명칭'으로 서술하십시오.
+    - [잘못된 예]: "1번 문항에서 통분을 잘하고 3번 문제에서 오답이 나옴." (X)
+    - [올바른 예]: "진분수의 덧셈 과정에서 공통분모를 정확히 찾아 계산하였으나, 대분수를 가분수로 변환하는 연산 과정에서 실수가 나타남." (O)
+- [학생별 고유성(개별화) 절대 필수]:
+  * 모든 학생의 평어가 판에 박힌 듯 비슷하거나 똑같아서는 절대 안 됩니다.
+  * 학생이 실제로 시험지에 적은 손글씨 답안의 구체적인 어휘, 표현, 풀이식이나 선택한 소재를 평어 문장에 직접 인용하거나 반영하여 학생마다 전혀 다른 고유한 평어를 작성하세요.
+    (예: 국어의 경우 학생이 적은 구체적 근거나 제안 내용 인용, 수학의 경우 학생이 푼 계산 과정 및 오류 지점 지목)
+- [상투적 정형 문구 사용 금지]:
+  * "성취기준에 잘 도달함", "지속적인 관심과 노력이 요구됨", "훌륭한 성취를 보임", "앞으로의 발전이 기대됨" 같은 뻔하고 모든 학생에게 복사 가능한 문구는 일절 사용하지 마십시오.
+- 구성: 학생의 구체적 강점 1가지 + 보완할 구체적 학습 포인트 1가지를 자연스럽게 연결하여 작성하세요.
+- {tone_instruction}
 
 [응답 JSON 스키마]
 {{
-  "과목": "{student.get('과목','') or (matched_rubric.get('과목','') if matched_rubric else '')}",
-  "단원명": "{student.get('단원명','') or (matched_rubric.get('단원명','') if matched_rubric else '')}",
-  "답안요약_및_근거": "학생이 작성한 주요 답안 요약 및 기준 대비 채점 이유",
+  "반": "시험지 1쪽 상단에 적힌 반 숫자",
+  "번호": "{scan_order_num}",
+  "이름": "시험지 1쪽 상단에 손글씨로 적힌 실제 학생 이름 (한글 2~4자)",
+  "과목": "{target_subject or '시험지 과목'}",
+  "단원명": "시험지 단원 번호 및 명칭",
+  "답안요약_및_근거": "기준안의 정답 대비 학생이 맞힌 문항 및 오답 사유 구체적 기술",
   "등급": "매우잘함 / 잘함 / 보통 / 노력요함 중 하나",
-  "평가의견": "공백 포함 130~170자 내외의 종합 평어 문장"
+  "평가의견": "공백 포함 90~110자 내외의 학생 언급과 문항 번호가 배제된 개별 맞춤 평어 문장"
 }}
 """
 
         contents = [grading_prompt]
+        if header_crop:
+            contents.append("[★ [이미지 1] 학생 인적사항 기재란 확대 이미지 - 학생의 실제 손글씨 이름과 번호는 반드시 여기서 정확히 판독하세요]")
+            contents.append(header_crop)
+
         for p_idx, page in enumerate(student["pages"]):
-            contents.append(f"[학생 시험지 {p_idx+1}페이지 (파일명: {page['filename']} p.{page['page_num']})]")
+            contents.append(f"[학생 시험지 {p_idx+1}페이지 전체 (파일명: {page['filename']} p.{page['page_num']})]")
             contents.append(page["image"])
 
         response_text = self._call_with_retry(contents, json_mode=True)
@@ -389,11 +640,11 @@ class GeminiGrader:
                 grade_result = json.loads(match.group(0))
             else:
                 grade_result = {
-                    "과목": student.get("과목", ""),
-                    "단원명": student.get("단원명", ""),
+                    "과목": target_subject,
+                    "단원명": "",
                     "답안요약_및_근거": "채점 분석 중 일시적 파싱 오류 발생",
                     "등급": "보통",
-                    "평가의견": "학생의 성취 수준을 평가 기준에 따라 종합적으로 검토하였으며 지속적인 관심과 노력이 요구됨."
+                    "평가의견": "평가 기준에 따른 주요 성취 요소를 충족하였으나 문제 해결 과정에서 세부적인 보완이 필요함."
                 }
 
         # 4단계 등급 유효성 보정
@@ -406,9 +657,39 @@ class GeminiGrader:
                 break
         grade_result["등급"] = final_grade
 
-        # 평가의견 및 글자 수 계산
-        comment = str(grade_result.get("평가의견", "")).strip()
-        grade_result["평가의견"] = comment
-        grade_result["글자수"] = len(comment)
+        # 번호 보정: 시험지는 항상 번호 순서대로 정리되어 있으므로 스캔 순번(1, 2, 3...)을 최우선 기준으로 유지
+        parsed_num = str(grade_result.get("번호", "")).strip()
+        digits = re.findall(r'\d+', parsed_num)
+        if digits and abs(int(digits[0]) - int(scan_order_num)) <= 2:
+            grade_result["번호"] = digits[0]
+        else:
+            grade_result["번호"] = scan_order_num
+
+        # 이름 보정: AI가 읽은 이름 검증 및 2차 전담 핀포인트 판독
+        parsed_name = str(grade_result.get("이름", "")).strip()
+        # 유효한 한글 이름인지 검증 (2~4자)
+        is_valid_name = bool(re.match(r'^[가-힣]{2,4}$', parsed_name)) and parsed_name not in ["미상", "학생", "None", "null"]
+
+        if not is_valid_name and header_crop:
+            # 2차 핀포인트 전담 판독 실행 (속도가 조금 느려지더라도 확실히 인식!)
+            refined_name = self._recognize_name_from_crop(header_crop)
+            if refined_name and re.match(r'^[가-힣]{2,4}$', refined_name):
+                grade_result["이름"] = refined_name
+            else:
+                grade_result["이름"] = parsed_name if parsed_name and parsed_name not in ["None", "null"] else f"학생_{scan_order_num}"
+        else:
+            grade_result["이름"] = parsed_name if is_valid_name else f"학생_{scan_order_num}"
+
+        # 평어 정제 및 글자 수 재계산 (학생 지칭 주어 및 문제 번호/선택지 기호 완벽 제거)
+        raw_comment = str(grade_result.get("평가의견", "")).strip()
+        final_comment = self._clean_comment(raw_comment, grade_result.get("이름", ""))
+        grade_result["평가의견"] = final_comment
+        grade_result["글자수"] = len(final_comment)
+
+        parsed_class = str(grade_result.get("반", "")).strip()
+        if parsed_class and parsed_class not in ["None", "null", ""]:
+            grade_result["반"] = parsed_class
+        else:
+            grade_result["반"] = student.get("반", "")
 
         return grade_result

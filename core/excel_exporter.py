@@ -53,15 +53,11 @@ def create_grading_excel(results: List[Dict[str, Any]]) -> bytes:
     # 기본 생성된 기본 시트 제거 준비
     default_sheet = wb.active
 
-    # 과목별(또는 과목_단원별) 그룹핑
+    # 과목별 그룹핑 (시트가 과목별로 단정하게 1개씩 생성되도록 보장)
     grouped_data: Dict[str, List[Dict[str, Any]]] = {}
     for r in results:
         subject = str(r.get("과목", "공통")).strip() or "기타과목"
-        unit = str(r.get("단원명", "")).strip()
-        
-        # 탭 그룹 키: 과목_단원 요약
-        short_unit = re.sub(r'^\d+\.\s*', '', unit)
-        group_key = f"{subject}_{short_unit}" if short_unit else subject
+        group_key = subject
         
         if group_key not in grouped_data:
             grouped_data[group_key] = []
@@ -96,7 +92,7 @@ def create_grading_excel(results: List[Dict[str, Any]]) -> bytes:
         ("단원명(평가범위)", 22, "left"),
         ("학생 답안 요약 및 채점 근거", 35, "left"),
         ("등급", 12, "center"),
-        ("평가 의견 (150자 내외)", 55, "left"),
+        ("평가 의견 (100자 내외)", 55, "left"),
         ("글자 수", 10, "center")
     ]
 

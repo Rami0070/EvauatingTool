@@ -25,6 +25,7 @@ wheels/
 venv/
 .venv/
 ENV/
+python_env/
 
 # PyInstaller & Executables (대용량 단일 실행파일 제외 - 100MB 제한)
 *.exe

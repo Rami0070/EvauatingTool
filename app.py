@@ -1,10 +1,26 @@
 import sys
 import os
+import concurrent.futures
+import threading
 
 # 모듈 탐색 경로 보정
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
+
+# .env 환경 설정 자동 로드 (API 키 보안 및 자동 입력)
+env_file = os.path.join(current_dir, ".env")
+if os.path.exists(env_file):
+    try:
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    if k.strip() == "GEMINI_API_KEY" and not os.environ.get("GEMINI_API_KEY"):
+                        os.environ["GEMINI_API_KEY"] = v.strip()
+    except Exception:
+        pass
 
 import streamlit as st
 import pandas as pd
@@ -12,6 +28,16 @@ import json
 import time
 import re
 from typing import List, Dict, Any
+
+import importlib
+import core.pdf_processor
+import core.gemini_grader
+import core.excel_exporter
+
+# Streamlit 재실행 시에도 항상 최신 core 모듈 로드 보장
+importlib.reload(core.pdf_processor)
+importlib.reload(core.gemini_grader)
+importlib.reload(core.excel_exporter)
 
 from core.pdf_processor import convert_multiple_pdfs_to_page_items
 from core.gemini_grader import GeminiGrader
@@ -188,26 +214,41 @@ with st.sidebar:
     st.markdown("### ⚙️ 시스템 설정")
     st.caption("초등학교 교사용 스마트 AI 평가 관리실")
     
-    # Gemini API Key
+    # Gemini API Key (환경변수 또는 .env 자동 연동)
     gemini_key = st.text_input(
         "🔑 Gemini API Key",
         value=os.getenv("GEMINI_API_KEY", ""),
         type="password",
-        help="Google AI Studio에서 발급받은 Gemini API 키를 입력하세요."
+        help="Google Gemini API 키가 기본 적용되어 있습니다. 필요한 경우 변경할 수 있습니다."
     )
     
-    # 모델 선택
+    # 모델 선택 (무료 쿼터 최적화)
     model_choice = st.selectbox(
         "🧠 Gemini Vision 모델 선택",
         options=[
-            "gemini-2.5-flash",
-            "gemini-2.5-pro",
-            "gemini-1.5-flash",
-            "gemini-1.5-pro"
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3.5-flash",
+            "gemini-3.8-flash"
         ],
         index=0,
-        help="2.5-flash는 빠르고 우수한 멀티모달 인식 성능을 제공합니다."
+        help="3.5-flash-lite는 1~2초대로 가장 빠르고 일일 쿼터가 넉넉합니다. (강력 추천)"
     )
+
+    st.markdown("---")
+    st.markdown("### 📑 시험지 구성 방식 (쿼터 절약)")
+
+    split_mode_choice = st.radio(
+        "시험지 페이지 분할 방식",
+        options=[
+            ("2pages", "📄 2페이지씩 앞·뒷장 (추천: 쿼터 소모 0회 / 초고속)"),
+            ("1page", "📄 1페이지씩 단면 (쿼터 소모 0회 / 초고속)"),
+            ("auto", "🔍 AI 자동 감지 (양식 불규칙 시)")
+        ],
+        format_func=lambda x: x[1],
+        index=0,
+        help="앞·뒷장 2페이지 단위로 선택하시면 헤더 판독에 API를 전혀 쓰지 않아 일일 무료 쿼터를 100% 아낄 수 있습니다."
+    )[0]
     
     st.markdown("---")
     st.markdown("### ✍️ 평어 작성 옵션")
@@ -249,7 +290,7 @@ st.markdown(
     <div class="app-header">
         <h1>🌱 AI 초등 수행평가 자동 채점 & 평어 생성기</h1>
         <p>어떤 서식의 평가 계획서와 기준안이든 Vision AI가 자동으로 구조화하고, 
-        학생들의 손글씨·분수 그림·꺾은선그래프·포스터를 꼼꼼히 채점하여 150자 생기부 맞춤 평어를 완성합니다.</p>
+        학생들의 손글씨·분수 그림·꺾은선그래프·포스터를 꼼꼼히 채점하여 100자 내외 개별 맞춤 평어를 완성합니다.</p>
     </div>
     """,
     unsafe_allow_html=True
@@ -367,47 +408,86 @@ if start_btn:
                 progress_bar.progress(0.4 + pct * 0.2)
                 status_box.markdown(f'<div class="step-chip"><b>Step 2/3</b> {msg}</div>', unsafe_allow_html=True)
 
-            student_submissions = grader.group_student_exam_pages(exam_pages, progress_callback=step2_cb)
+            student_submissions = grader.group_student_exam_pages(
+                exam_pages,
+                split_mode=split_mode_choice,
+                progress_callback=step2_cb
+            )
 
             # -----------------------------------------------------------------
-            # Step 3: 기준 기반 채점, 4단계 등급 부여 및 150자 평어 생성
+            # Step 3: 기준 기반 채점, 4단계 등급 부여 및 100자 맞춤 평어 생성
             # -----------------------------------------------------------------
             status_box.markdown(
-                '<div class="step-chip"><b>Step 3/3</b> 학생별 시험지 정밀 채점 및 150자 평어 생성 중...</div>',
+                '<div class="step-chip"><b>Step 3/3</b> 학생별 시험지 정밀 채점 및 100자 맞춤 평어 생성 중...</div>',
                 unsafe_allow_html=True
             )
             
-            graded_list = []
             total_students = len(student_submissions)
+            graded_list = [None] * total_students
+            completed_students = 0
+            grade_lock = threading.Lock()
 
-            for idx, student in enumerate(student_submissions):
-                curr_pct = 0.6 + ((idx + 1) / total_students) * 0.38
-                progress_bar.progress(min(curr_pct, 0.98))
-                status_box.markdown(
-                    f'<div class="step-chip"><b>Step 3/3</b> [{idx+1}/{total_students}] {student.get("이름","학생")}({student.get("번호","")}번) 채점 및 평어 생성 중...</div>',
-                    unsafe_allow_html=True
-                )
+            def process_single_student_grade(task_item):
+                s_idx, s_data = task_item
+                try:
+                    g_info = grader.grade_student(
+                        student=s_data,
+                        rubrics=merged_rubrics,
+                        tone_style=tone_choice
+                    )
+                except Exception as grade_err:
+                    g_info = {
+                        "과목": s_data.get("과목", ""),
+                        "단원명": s_data.get("단원명", ""),
+                        "답안요약_및_근거": f"채점 재시도 후 일시 오류 ({str(grade_err)[:50]})",
+                        "등급": "보통",
+                        "평가의견": "학생의 성취 수준을 평가 기준에 따라 종합적으로 검토하였으며 꾸준한 학습 태도와 노력이 필요함.",
+                        "글자수": 58,
+                        "이름": s_data.get("이름", "미상"),
+                        "번호": s_data.get("번호", "미상"),
+                        "반": s_data.get("반", "")
+                    }
 
-                grade_info = grader.grade_student(
-                    student=student,
-                    rubrics=merged_rubrics,
-                    tone_style=tone_choice
-                )
+                sub = s_data.get("과목") or g_info.get("과목") or "기타과목"
+                # 스캔 순번(1, 2, 3...)과 손글씨 번호 안전 결합
+                assigned_num = str(g_info.get("번호") or s_data.get("번호", str(s_idx + 1))).strip()
+                assigned_name = str(g_info.get("이름") or s_data.get("이름", f"학생_{assigned_num}")).strip()
 
-                # 최종 통합 레코드 생성
-                combined_record = {
-                    "번호": student.get("번호", "미상"),
-                    "이름": student.get("이름", "미상"),
-                    "반": student.get("반", ""),
-                    "과목": grade_info.get("과목") or student.get("과목", ""),
-                    "단원명": grade_info.get("단원명") or student.get("단원명", ""),
-                    "답안요약_및_근거": grade_info.get("답안요약_및_근거", ""),
-                    "등급": grade_info.get("등급", "보통"),
-                    "평가의견": grade_info.get("평가의견", ""),
-                    "글자수": grade_info.get("글자수", len(grade_info.get("평가의견", ""))),
-                    "student_key": student.get("student_key", "")
+                rec = {
+                    "번호": assigned_num,
+                    "이름": assigned_name,
+                    "반": g_info.get("반") or s_data.get("반", ""),
+                    "과목": sub,
+                    "단원명": g_info.get("단원명") or s_data.get("단원명", ""),
+                    "답안요약_및_근거": g_info.get("답안요약_및_근거", ""),
+                    "등급": g_info.get("등급", "보통"),
+                    "평가의견": g_info.get("평가의견", ""),
+                    "글자수": g_info.get("글자수", len(g_info.get("평가의견", ""))),
+                    "student_key": s_data.get("student_key", "")
                 }
-                graded_list.append(combined_record)
+                return s_idx, rec
+
+            # 무료 쿼터 안정성을 위해 2개 동시 스레드로 병렬 채점
+            max_grade_workers = min(2, total_students) if total_students > 0 else 1
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_grade_workers) as executor:
+                grade_tasks = [(i, s) for i, s in enumerate(student_submissions)]
+                grade_futures = [executor.submit(process_single_student_grade, gt) for gt in grade_tasks]
+
+                for future in concurrent.futures.as_completed(grade_futures):
+                    s_idx, combined_record = future.result()
+                    graded_list[s_idx] = combined_record
+                    
+                    with grade_lock:
+                        completed_students += 1
+                        curr_pct = 0.6 + (completed_students / total_students) * 0.38
+                        progress_bar.progress(min(curr_pct, 0.98))
+                        status_box.markdown(
+                            f'<div class="step-chip"><b>Step 3/3</b> [{completed_students}/{total_students}] {combined_record.get("이름","학생")}({combined_record.get("번호","")}번) 채점 완료!</div>',
+                            unsafe_allow_html=True
+                        )
+
+            # 혹시 누락된 레코드 정리
+            graded_list = [r for r in graded_list if r is not None]
 
             # 번호 기준 정수 오름차순 정렬 (미상은 맨 뒤)
             graded_list.sort(key=get_student_sort_key)
@@ -417,7 +497,14 @@ if start_btn:
             status_box.success(f"🎉 채점 및 평어 생성이 완료되었습니다! (총 {len(graded_list)}명 학생 채점 완료)")
 
         except Exception as ex:
-            st.error(f"❌ 처리 중 오류가 발생했습니다: {str(ex)}")
+            # 부분 성공 데이터가 있다면 보존하여 화면에 표출
+            valid_done = [r for r in graded_list if r is not None] if 'graded_list' in locals() else []
+            if valid_done:
+                valid_done.sort(key=get_student_sort_key)
+                st.session_state.graded_results = valid_done
+                st.warning(f"⚠️ 일부 처리 중 알림: {str(ex)} (채점 완료된 {len(valid_done)}명 결과는 아래에 정상 보존되었습니다.)")
+            else:
+                st.error(f"❌ 처리 중 오류가 발생했습니다: {str(ex)}")
 
 # -----------------------------------------------------------------------------
 # 6. 결과 확인 및 실시간 데이터 수정(st.data_editor) & 엑셀 다운로드
@@ -469,7 +556,7 @@ if st.session_state.graded_results:
                         required=True,
                         width="small"
                     ),
-                    "평가의견": st.column_config.TextColumn("평가 의견 (150자 내외)", width="large"),
+                    "평가의견": st.column_config.TextColumn("평가 의견 (100자 내외)", width="large"),
                     "글자수": st.column_config.NumberColumn("글자 수", width="small", disabled=True)
                 },
                 num_rows="dynamic",
