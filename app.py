@@ -193,9 +193,30 @@ div.stDownloadButton > button:first-child:active {
     font-weight: 600;
     border: 1px solid #C8E6C9;
 }
+
+/* 기본 Streamlit footer 숨김 */
+footer {
+    visibility: hidden;
+}
+
+/* 화면 우측 하단 크레딧 워터마크 */
+.footer-watermark {
+    position: fixed;
+    right: 18px;
+    bottom: 10px;
+    font-size: 0.75rem;
+    color: #4A5568;
+    opacity: 0.38;
+    letter-spacing: 0.03em;
+    user-select: none;
+    pointer-events: none;
+    z-index: 999999;
+    font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+st.markdown('<div class="footer-watermark">Designed by Rami since 2026</div>', unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
 # 2. 세션 상태 초기화
