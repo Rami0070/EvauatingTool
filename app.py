@@ -46,8 +46,10 @@ from core.excel_exporter import create_grading_excel, get_student_sort_key
 # -----------------------------------------------------------------------------
 # 1. 페이지 기본 설정 및 파스텔 그린 3D 테마 CSS
 # -----------------------------------------------------------------------------
+APP_VERSION = "v1.0.0"
+
 st.set_page_config(
-    page_title="AI 수행평가 자동 채점 & 평어 생성기",
+    page_title=f"AI 수행평가 자동 채점 & 평어 생성기 {APP_VERSION}",
     page_icon="🌱",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -84,6 +86,16 @@ html, body, [class*="css"] {
     display: flex;
     align-items: center;
     gap: 0.6rem;
+}
+.version-badge {
+    font-size: 0.82rem;
+    font-weight: 600;
+    background-color: #2E7D32;
+    color: #FFFFFF;
+    padding: 3px 10px;
+    border-radius: 12px;
+    vertical-align: middle;
+    letter-spacing: 0.02em;
 }
 .app-header p {
     color: #2E7D32;
@@ -216,7 +228,7 @@ footer {
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-st.markdown('<div class="footer-watermark">Designed by Rami since 2026</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="footer-watermark">Designed by Rami since 2026 | {APP_VERSION}</div>', unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
 # 2. 세션 상태 초기화
@@ -233,7 +245,7 @@ if "editing_dfs" not in st.session_state:
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### ⚙️ 시스템 설정")
-    st.caption("초등학교 교사용 스마트 AI 평가 관리실")
+    st.caption(f"초등학교 교사용 스마트 AI 평가 관리실 ({APP_VERSION})")
     
     # Gemini API Key (환경변수 또는 .env 자동 연동)
     gemini_key = st.text_input(
@@ -307,9 +319,9 @@ with st.sidebar:
 # 4. 메인 화면 헤더 및 파일 업로드 섹션
 # -----------------------------------------------------------------------------
 st.markdown(
-    """
+    f"""
     <div class="app-header">
-        <h1>🌱 AI 초등 수행평가 자동 채점 & 평어 생성기</h1>
+        <h1>🌱 AI 초등 수행평가 자동 채점 & 평어 생성기 <span class="version-badge">{APP_VERSION}</span></h1>
         <p>어떤 서식의 평가 계획서와 기준안이든 Vision AI가 자동으로 구조화하고, 
         학생들의 손글씨·분수 그림·꺾은선그래프·포스터를 꼼꼼히 채점하여 100자 내외 개별 맞춤 평어를 완성합니다.</p>
     </div>
