@@ -31,6 +31,7 @@ python_env/
 *.exe
 *.manifest
 *.spec
+*.zip
 
 # IDE & OS
 .vscode/
